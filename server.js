@@ -113,6 +113,7 @@ app.post('/auth/setup', gate, w(async (q, r) => {
   const id = crypto.randomUUID(), h = await mkHash(pin);
   await pool.query('insert into staff(id,name,role,salt,hash) values($1,$2,$3,$4,$5)', [id, name.trim(), 'owner', h.salt, h.hash]);
   await loadStaff();
+  await logRow(staff.get(id), 'AUTH', 'auth', id, 'إنشاء حساب المالك');
   r.json(session(staff.get(id)));
 }));
 app.post('/auth/login', gate, w(async (q, r) => {
@@ -120,7 +121,11 @@ app.post('/auth/login', gate, w(async (q, r) => {
   const u = staff.get(id);
   if (!u || !u.active) return r.status(400).send('الحساب غير متاح');
   const bad = await checkLogin(u, pin);
-  if (bad) return r.status(bad.startsWith('محاولات') ? 429 : 400).send(bad);
+  if (bad) {
+    if (!bad.startsWith('محاولات')) await logRow(u, 'AUTH', 'auth', u.id, 'محاولة دخول فاشلة');
+    return r.status(bad.startsWith('محاولات') ? 429 : 400).send(bad);
+  }
+  await logRow(u, 'AUTH', 'auth', u.id, 'تسجيل دخول');
   r.json(session(u));
 }));
 app.get('/auth/me', gate, authn, (q, r) => r.json({ user: q.user.id ? pub(q.user) : null, setup: staff.size === 0 }));
@@ -134,6 +139,7 @@ app.post('/auth/pin', gate, authn, w(async (q, r) => {
   const h = await mkHash(next);
   await pool.query('update staff set salt=$2,hash=$3 where id=$1', [u.id, h.salt, h.hash]);
   await loadStaff();
+  await logRow(u, 'AUTH', 'auth', u.id, 'تغيير الرمز السري');
   r.sendStatus(204);
 }));
 
@@ -148,6 +154,7 @@ app.post('/auth/admin/staff', gate, authn, ownerOnly, w(async (q, r) => {
   const id = crypto.randomUUID(), h = await mkHash(pin);
   await pool.query('insert into staff(id,name,role,salt,hash) values($1,$2,$3,$4,$5)', [id, name.trim(), role, h.salt, h.hash]);
   await loadStaff();
+  await logRow(q.user, 'AUTH', 'staff', id, 'إضافة موظف: ' + name.trim() + ' (' + role + ')');
   r.json({ id });
 }));
 app.patch('/auth/admin/staff/:id', gate, authn, ownerOnly, w(async (q, r) => {
@@ -163,7 +170,94 @@ app.patch('/auth/admin/staff/:id', gate, authn, ownerOnly, w(async (q, r) => {
   await pool.query('update staff set name=$2,role=$3,active=$4,salt=$5,hash=$6 where id=$1', [u.id, m.name, m.role, m.active, m.salt, m.hash]);
   tries.delete(u.id);
   await loadStaff();
+  await logRow(q.user, 'AUTH', 'staff', u.id, 'تعديل موظف: ' + m.name + (b.role !== undefined ? ' (صلاحية: ' + m.role + ')' : '') +
+    (b.active !== undefined ? (m.active ? ' (تفعيل)' : ' (تعطيل)') : '') + (b.pin ? ' (رمز جديد)' : ''));
   r.sendStatus(204);
+}));
+
+// ===================== بيع ذرّي =====================
+// الفاتورة + خصم المخزون + رصيد العميل + الخزينة في معاملة واحدة: تنجح كلها أو تفشل كلها.
+// opid مفتاح يمنع تسجيل الفاتورة مرتين إذا أُعيد الإرسال بعد انقطاع الاتصال.
+const num = (v) => (typeof v === 'number' && isFinite(v) ? v : NaN);
+const M2 = (n) => Math.round(n * 100) / 100;
+app.post('/pos/sale', gate, authn, w(async (q, r) => {
+  const b = q.body || {};
+  const bad = (m) => r.status(400).send(m);
+  const op = typeof b.opid === 'string' && /^[\w-]{8,64}$/.test(b.opid) ? b.opid : '';
+  if (!op) return bad('مفتاح العملية مطلوب');
+  if (!['cash', 'card', 'transfer', 'credit'].includes(b.method)) return bad('طريقة دفع غير صحيحة');
+  if (!Array.isArray(b.items) || b.items.length < 1 || b.items.length > 200) return bad('بنود الفاتورة غير صحيحة');
+  const items = [];
+  for (const i of b.items) {
+    const price = num(i && i.price), cost = num(i && i.cost), qty = num(i && i.qty);
+    if (!i || typeof i.id !== 'string' || typeof i.name !== 'string' || !(price >= 0) || !(cost >= 0) || !(qty > 0)) return bad('بند غير صحيح');
+    items.push({ id: i.id, name: i.name.slice(0, 120), price, cost, qty, unit: i.unit === 'kg' ? 'kg' : 'pc' });
+  }
+  const sub = num(b.sub), disc = num(b.disc), tax = num(b.tax), total = num(b.total), paid = num(b.paid);
+  if (![sub, disc, tax, total, paid].every((x) => x >= 0)) return bad('مبالغ غير صحيحة');
+  if (Math.abs(items.reduce((a, i) => a + M2(i.price * i.qty), 0) - sub) > 0.05) return bad('المجموع لا يطابق البنود');
+  if (Math.abs(sub - disc + tax - total) > 0.02) return bad('الإجمالي لا يطابق المجموع والخصم والضريبة');
+  const credit = b.method === 'credit';
+  if (credit) {
+    if (typeof b.cid !== 'string' || !b.cid) return bad('اختر العميل');
+    if (paid > total + 0.001) return bad('المدفوع أكبر من الإجمالي');
+  } else if (paid < total - 0.001) return bad('المبلغ غير كافٍ');
+  const now = Date.now();
+  let ts = num(b.ts);
+  if (!(ts > now - 30 * 864e5 && ts < now + 10 * 60 * 1000)) ts = now;
+  const no = String(b.no || '').slice(0, 12) || String(ts).slice(-6);
+
+  const c = await pool.connect();
+  let open = false;
+  const stop = async (sql) => { if (open) { open = false; await c.query(sql); } };
+  try {
+    await c.query('begin'); open = true;
+    const dup = await c.query("select id, data from docs where col='sales' and data->>'opid'=$1", [op]);
+    if (dup.rows[0]) { await stop('rollback'); return r.json({ id: dup.rows[0].id, no: dup.rows[0].data.no, dup: true }); }
+    const need = new Map();
+    items.forEach((i) => need.set(i.id, (need.get(i.id) || 0) + i.qty));
+    for (const [pid, qty] of [...need].sort((x, y) => (x[0] < y[0] ? -1 : 1))) {
+      await c.query(
+        `update docs set data = jsonb_set(data,'{stock}',to_jsonb(greatest(0, round(coalesce((data->>'stock')::numeric,0) - $2::numeric, 3))))
+         where col='products' and id=$1`, [pid, qty]);
+    }
+    let cname = '';
+    if (credit) {
+      const cu = await c.query(
+        `update docs set data = jsonb_set(data,'{bal}',to_jsonb(round(coalesce((data->>'bal')::numeric,0) + $2::numeric, 2)))
+         where col='customers' and id=$1 returning data->>'name' as name`, [b.cid, M2(total - paid)]);
+      if (!cu.rows[0]) { await stop('rollback'); return bad('العميل غير موجود'); }
+      cname = cu.rows[0].name || '';
+    }
+    const id = crypto.randomUUID();
+    const sale = { ts, no, sub: M2(sub), disc: M2(disc), tax: M2(tax), total: M2(total), paid: M2(paid), method: b.method, items, opid: op };
+    if (credit) { sale.cid = b.cid; sale.cname = cname; }
+    if (b.ws === true) sale.ws = true;
+    if (q.user.id) { sale.by = q.user.id; sale.byn = q.user.name; }
+    await c.query('insert into docs(col,id,data) values($1,$2,$3)', ['sales', id, sale]);
+    const delta = M2(credit ? paid : total);
+    let bal = null;
+    if (delta) {
+      const t = await c.query(
+        `insert into docs(col,id,data) values('settings','treasury',jsonb_build_object('bal',$1::numeric))
+         on conflict (col,id) do update set data = jsonb_set(docs.data,'{bal}',to_jsonb(round(coalesce((docs.data->>'bal')::numeric,0) + $1::numeric, 2)))
+         returning (data->>'bal')::numeric as bal`, [delta]);
+      bal = Number(t.rows[0].bal);
+      await c.query('insert into docs(col,id,data) values($1,$2,$3)', ['cashlog', crypto.randomUUID(), { ts: Date.now(), d: delta, why: 'بيع #' + no, bal }]);
+    }
+    await stop('commit');
+    await logRow(q.user, 'POST', 'sales', id, '#' + no + ' · المبلغ ' + M2(total));
+    r.json({ id, no, bal });
+  } catch (e) {
+    try { await stop('rollback'); } catch (e2) { /* connection already lost */ }
+    if (e && e.code === '23505') { // سباق: وصل طلبان بنفس المفتاح معاً
+      const d2 = await pool.query("select id, data from docs where col='sales' and data->>'opid'=$1", [op]);
+      if (d2.rows[0]) return r.json({ id: d2.rows[0].id, no: d2.rows[0].data.no, dup: true });
+    }
+    throw e;
+  } finally {
+    c.release();
+  }
 }));
 
 app.use('/api', gate, authn);
@@ -175,6 +269,51 @@ app.use('/api/:col', (req, res, next) => {
   next();
 });
 
+
+// ===================== سجل العمليات =====================
+// يُسجَّل كل تعديل (إضافة/تعديل/حذف/استيراد) تلقائياً باسم المستخدم. القراءة للمالك فقط، ولا كتابة من الواجهة.
+async function logRow(u, m, col, rid, d) {
+  try {
+    await pool.query('insert into docs(col,id,data) values($1,$2,$3)',
+      ['oplog', crypto.randomUUID(), { ts: Date.now(), u: (u && u.id) || '', un: (u && u.name) || '', m, col, rid, d }]);
+  } catch (e) { console.error(e); }
+}
+async function audit(req, col, id, old) {
+  const b = req.body, bulk = id === '_bulk';
+  const x = { ...(old || {}), ...(b && typeof b === 'object' && !Array.isArray(b) ? b : {}) };
+  let d;
+  if (bulk) d = 'استيراد ' + (Array.isArray(b) ? b.length : 0) + ' سجل';
+  else {
+    const n = x.name || x.note || x.supplier || x.cname || (x.no ? '#' + x.no : '') || '';
+    const amt = x.total != null ? x.total : x.amt != null ? x.amt : null;
+    d = [n, amt != null ? 'المبلغ ' + amt : ''].filter(Boolean).join(' · ');
+  }
+  await logRow(req.user, bulk ? 'BULK' : req.method, col, bulk ? '' : id, d.slice(0, 160));
+}
+app.use('/api/:col', async (req, res, next) => {
+  const col = req.params.col;
+  if (col === 'oplog') {
+    return req.method === 'GET' && (staff.size === 0 || req.user.role === 'owner') ? next() : res.status(403).send('للمالك فقط');
+  }
+  if (req.method === 'GET') return next();
+  try {
+    const id = req.path.split('/')[1] || '', b = req.body;
+    const bk = b && typeof b === 'object' && !Array.isArray(b) ? Object.keys(b) : [];
+    // نتجاهل الحركات التلقائية المتكررة: رصيد الخزينة، وخصم المخزون/رصيد العميل مع كل بيع
+    const noise = col === 'cashlog' || (col === 'settings' && id === 'treasury') ||
+      (req.method === 'PATCH' && bk.length > 0 &&
+        ((col === 'products' && bk.every((k) => k === 'stock')) || (col === 'customers' && bk.every((k) => k === 'bal'))));
+    if (!noise) {
+      let old = null;
+      if (id && id !== '_bulk' && req.method !== 'POST') {
+        const x = await pool.query('select data from docs where col=$1 and id=$2', [col, id]);
+        old = x.rows[0] ? x.rows[0].data : null;
+      }
+      res.on('finish', () => { if (res.statusCode < 300) audit(req, col, id, old); });
+    }
+  } catch (e) { console.error(e); }
+  next();
+});
 
 app.get('/api/:col', w(async (q, r) => {
   const x = await pool.query('select id, data from docs where col=$1 order by created desc limit 2000', [q.params.col]);
@@ -233,7 +372,11 @@ app.delete('/api/:col/:id', w(async (q, r) => {
   await pool.query(`create table if not exists staff(
     id text primary key, name text not null, role text not null, salt text not null, hash text not null,
     active boolean not null default true, created timestamptz not null default now())`);
+  await pool.query(`create unique index if not exists docs_sale_opid on docs ((data->>'opid')) where col='sales' and data->>'opid' is not null`);
   await loadStaff();
+  const prune = () => pool.query("delete from docs where col='oplog' and created < now() - interval '180 days'").catch((e) => console.error(e));
+  prune(); setInterval(prune, 24 * 3600 * 1000);
   const port = process.env.PORT || 3000;
   app.listen(port, () => console.log('POS running on port ' + port));
 })().catch((e) => { console.error(e); process.exit(1); });
+  
